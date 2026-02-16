@@ -2,63 +2,76 @@ import { getServiceSupabase } from '@/lib/supabase';
 import { NextResponse } from 'next/server';
 import Papa from 'papaparse';
 
+function findCol(row, names) {
+  for (const n of names) {
+    const keys = Object.keys(row);
+    const match = keys.find(k => k.trim().toLowerCase() === n.toLowerCase());
+    if (match && row[match] !== undefined && row[match] !== '') return row[match];
+  }
+  return '';
+}
+
 export async function POST(request) {
   const db = getServiceSupabase();
 
   try {
     const formData = await request.formData();
     const file = formData.get('file');
+    if (!file) return NextResponse.json({ error: 'No file provided' }, { status: 400 });
 
-    if (!file) {
-      return NextResponse.json({ error: 'No file provided' }, { status: 400 });
-    }
+    let text = await file.text();
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
 
-    const text = await file.text();
-    const { data: rows } = Papa.parse(text, { header: true, skipEmptyLines: true });
+    const { data: rows, errors: parseErrors } = Papa.parse(text, { header: true, skipEmptyLines: true, transformHeader: h => h.trim() });
+
+    const headers = rows.length > 0 ? Object.keys(rows[0]) : [];
 
     let imported = 0;
-    let updated = 0;
+    let skipped = 0;
     let errors = [];
 
     for (const row of rows) {
-      const orderNumber = row['Name'] || row['Order'] || row['order_number'] || '';
-      if (!orderNumber) continue;
+      const orderNumber = findCol(row, ['Name', 'Order', 'Order Number', 'order_number', 'Order Name', 'order_name', '#', 'Order ID', 'order_id']);
+      if (!orderNumber) { skipped++; continue; }
 
+      const rawName = findCol(row, ['Billing Name', 'Shipping Name', 'Customer Name', 'Customer', 'customer_name']);
       const record = {
-        order_number: orderNumber.replace('#', '').trim(),
-        order_date: row['Created at'] || row['created_at'] || null,
-        total_amount: parseFloat((row['Total'] || row['total'] || '0').replace(/[^0-9.-]/g, '')) || 0,
-        currency: row['Currency'] || 'USD',
-        financial_status: (row['Financial Status'] || row['financial_status'] || 'paid').toLowerCase(),
-        fulfillment_status: (row['Fulfillment Status'] || row['fulfillment_status'] || 'unfulfilled').toLowerCase() || 'unfulfilled',
-        customer_email: (row['Email'] || row['email'] || '').toLowerCase().trim(),
-        customer_name: `${row['Billing Name'] || row['Shipping Name'] || row['customer_name'] || ''}`.trim(),
-        customer_phone: row['Billing Phone'] || row['Shipping Phone'] || row['Phone'] || null,
-        payment_reference: row['Payment Reference'] || row['payment_reference'] || null,
-        card_last4: row['Card Last4'] || row['card_last4'] || null,
-        line_items: row['Lineitem name'] ? JSON.stringify([{ name: row['Lineitem name'], qty: row['Lineitem quantity'] || 1, price: row['Lineitem price'] || 0 }]) : null,
+        order_number: String(orderNumber).replace('#', '').trim(),
+        order_date: findCol(row, ['Created at', 'created_at', 'Created At', 'Date', 'Order Date', 'Created', 'Paid at']) || null,
+        total_amount: parseFloat(String(findCol(row, ['Total', 'total', 'Order Total', 'Amount', 'Grand Total', 'Subtotal']) || '0').replace(/[^0-9.-]/g, '')) || 0,
+        currency: findCol(row, ['Currency', 'currency']) || 'USD',
+        financial_status: (findCol(row, ['Financial Status', 'financial_status', 'Payment Status', 'payment_status']) || 'paid').toLowerCase(),
+        fulfillment_status: (findCol(row, ['Fulfillment Status', 'fulfillment_status', 'Fulfillment', 'fulfillment']) || 'unfulfilled').toLowerCase() || 'unfulfilled',
+        customer_email: (findCol(row, ['Email', 'email', 'Customer Email', 'customer_email', 'Billing Email']) || '').toLowerCase().trim(),
+        customer_name: rawName || '',
+        customer_phone: findCol(row, ['Billing Phone', 'Shipping Phone', 'Phone', 'phone', 'Customer Phone']) || null,
+        payment_reference: findCol(row, ['Payment Reference', 'payment_reference', 'Payment Ref', 'Transaction ID']) || null,
+        card_last4: findCol(row, ['Card Last4', 'card_last4', 'Last 4', 'Card']) || null,
+        line_items: findCol(row, ['Lineitem name', 'Line Item Name']) ? JSON.stringify([{ name: findCol(row, ['Lineitem name', 'Line Item Name']), qty: findCol(row, ['Lineitem quantity']) || 1, price: findCol(row, ['Lineitem price']) || 0 }]) : null,
       };
 
-      const { data, error } = await db
+      const { error } = await db
         .from('shopify_orders')
         .upsert(record, { onConflict: 'order_number' })
         .select();
 
       if (error) {
-        errors.push({ order: orderNumber, error: error.message });
+        errors.push({ order: record.order_number, error: error.message });
       } else {
         imported++;
       }
     }
 
-    await autoAssignTiers(db);
+    if (imported > 0) await autoAssignTiers(db);
 
     return NextResponse.json({
       success: true,
       imported,
-      updated,
+      skipped,
       errors: errors.slice(0, 10),
       total_rows: rows.length,
+      headers_found: headers.slice(0, 20),
+      parse_errors: parseErrors ? parseErrors.length : 0,
     });
   } catch (error) {
     console.error('Import error:', error);
@@ -74,7 +87,6 @@ async function autoAssignTiers(db) {
     .eq('financial_status', 'paid');
 
   if (!orders || orders.length === 0) return;
-
   const now = new Date();
 
   for (const order of orders) {
