@@ -50,7 +50,7 @@ export default function SettingsPage() {
             <h3 className="text-white font-semibold">API Connections</h3>
           </div>
           <div className="space-y-3">
-            <ApiStatus label="Supabase" envVar="NEXT_PUBLIC_SUPABASE_URL" />
+            <ApiStatus label="Supabase" value={process.env.NEXT_PUBLIC_SUPABASE_URL} isPublic={true} />
             <ApiStatus label="Shopify" envVar="SHOPIFY_ACCESS_TOKEN" />
             <ApiStatus label="Klaviyo" envVar="KLAVIYO_API_KEY" />
             <ApiStatus label="Google Gemini" envVar="GEMINI_API_KEY" />
@@ -139,10 +139,8 @@ function ImportSection({ title, icon, description, endpoint, fieldName, accept, 
   );
 }
 
-function ApiStatus({ label, envVar }) {
-  // Client-side check for NEXT_PUBLIC vars only
-  const isPublic = envVar.startsWith('NEXT_PUBLIC_');
-  const isSet = isPublic ? !!process.env[envVar] : null;
+function ApiStatus({ label, value, isPublic = false }) {
+  const isSet = isPublic ? !!value : null;
 
   return (
     <div className="flex items-center justify-between p-3 bg-dark-800 rounded-lg">
