@@ -2,6 +2,15 @@ import { getServiceSupabase } from '@/lib/supabase';
 import { NextResponse } from 'next/server';
 import Papa from 'papaparse';
 
+function findCol(row, names) {
+  for (const n of names) {
+    const keys = Object.keys(row);
+    const match = keys.find(k => k.trim().toLowerCase() === n.toLowerCase());
+    if (match && row[match] !== undefined && row[match] !== '') return row[match];
+  }
+  return '';
+}
+
 export async function POST(request) {
   const db = getServiceSupabase();
 
@@ -10,48 +19,62 @@ export async function POST(request) {
     const file = formData.get('file');
     const processor = formData.get('processor') || 'green_payments';
 
-    if (!file) {
-      return NextResponse.json({ error: 'No file provided' }, { status: 400 });
-    }
+    if (!file) return NextResponse.json({ error: 'No file provided' }, { status: 400 });
 
-    const text = await file.text();
-    const { data: rows } = Papa.parse(text, { header: true, skipEmptyLines: true });
+    let text = await file.text();
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+
+    const { data: rows, errors: parseErrors } = Papa.parse(text, { header: true, skipEmptyLines: true, transformHeader: h => h.trim() });
+
+    const headers = rows.length > 0 ? Object.keys(rows[0]) : [];
 
     let imported = 0;
+    let skipped = 0;
     let errors = [];
 
     for (const row of rows) {
+      const cbRef = findCol(row, ['Reference', 'Chargeback ID', 'Case Number', 'ref', 'Case ID', 'Dispute ID', 'CB Reference', 'ARN', 'ID', 'Case #', 'Chargeback Reference']);
+      const amount = parseFloat(String(findCol(row, ['Amount', 'amount', 'Dispute Amount', 'Chargeback Amount', 'CB Amount', 'Transaction Amount', 'Txn Amount', 'Total']) || '0').replace(/[^0-9.-]/g, '')) || 0;
+
+      if (!cbRef && !amount) { skipped++; continue; }
+
       const record = {
         processor,
-        chargeback_ref: row['Reference'] || row['Chargeback ID'] || row['Case Number'] || row['ref'] || '',
-        transaction_id: row['Transaction ID'] || row['transaction_id'] || null,
-        dispute_date: row['Dispute Date'] || row['dispute_date'] || row['Date'] || null,
-        transaction_date: row['Transaction Date'] || row['transaction_date'] || null,
-        amount: parseFloat((row['Amount'] || row['amount'] || row['Dispute Amount'] || '0').replace(/[^0-9.-]/g, '')) || 0,
-        customer_name: row['Customer Name'] || row['Cardholder'] || row['Name'] || null,
-        customer_email: (row['Email'] || row['Customer Email'] || row['email'] || '').toLowerCase().trim() || null,
-        card_last4: row['Card Last 4'] || row['Last 4'] || row['card_last4'] || null,
-        reason_code: row['Reason Code'] || row['reason_code'] || null,
-        reason_description: row['Reason'] || row['Description'] || row['reason'] || null,
-        processor_status: (row['Status'] || row['status'] || 'open').toLowerCase(),
+        chargeback_ref: cbRef || ('auto_' + Date.now() + '_' + imported),
+        transaction_id: findCol(row, ['Transaction ID', 'transaction_id', 'Txn ID', 'Trans ID', 'Transaction #', 'Auth Code']) || null,
+        dispute_date: findCol(row, ['Dispute Date', 'dispute_date', 'Date', 'CB Date', 'Chargeback Date', 'Filed Date', 'Open Date', 'Created']) || null,
+        transaction_date: findCol(row, ['Transaction Date', 'transaction_date', 'Txn Date', 'Trans Date', 'Sale Date', 'Order Date', 'Original Transaction Date']) || null,
+        amount,
+        customer_name: findCol(row, ['Customer Name', 'Cardholder', 'Name', 'Cardholder Name', 'Card Holder', 'Customer']) || null,
+        customer_email: (findCol(row, ['Email', 'Customer Email', 'email', 'Cardholder Email']) || '').toLowerCase().trim() || null,
+        card_last4: findCol(row, ['Card Last 4', 'Last 4', 'card_last4', 'Last Four', 'Card Number', 'Card #', 'Card Last4', 'Last 4 Digits']) || null,
+        reason_code: findCol(row, ['Reason Code', 'reason_code', 'Code', 'CB Reason Code', 'Chargeback Reason Code']) || null,
+        reason_description: findCol(row, ['Reason', 'Description', 'reason', 'Reason Description', 'CB Reason', 'Chargeback Reason', 'Dispute Reason']) || null,
+        processor_status: (findCol(row, ['Status', 'status', 'Case Status', 'Dispute Status', 'CB Status']) || 'open').toLowerCase(),
       };
-
-      if (!record.chargeback_ref && !record.amount) continue;
 
       const { error } = await db.from('chargebacks').insert(record);
       if (error) {
-        errors.push({ ref: record.chargeback_ref, error: error.message });
+        if (error.message.includes('duplicate') || error.message.includes('unique')) {
+          skipped++;
+        } else {
+          errors.push({ ref: record.chargeback_ref, error: error.message });
+        }
       } else {
         imported++;
       }
     }
 
-    const matchResult = await runMatching(db);
+    let matchResult = { total: 0, high: 0, medium: 0, low: 0 };
+    if (imported > 0) matchResult = await runMatching(db);
 
     return NextResponse.json({
       success: true,
       imported,
+      skipped,
       errors: errors.slice(0, 10),
+      total_rows: rows.length,
+      headers_found: headers.slice(0, 20),
       matching: matchResult,
     });
   } catch (error) {
@@ -66,7 +89,7 @@ async function runMatching(db) {
     .select('*')
     .is('matched_order_id', null);
 
-  if (!unmatched || unmatched.length === 0) return { total: 0, matched: 0 };
+  if (!unmatched || unmatched.length === 0) return { total: 0, high: 0, medium: 0, low: 0 };
 
   let highMatches = 0, medMatches = 0, lowMatches = 0;
 
@@ -136,6 +159,5 @@ async function runMatching(db) {
     high: highMatches,
     medium: medMatches,
     low: lowMatches,
-    still_unmatched: unmatched.length - highMatches - medMatches - lowMatches,
   };
 }
