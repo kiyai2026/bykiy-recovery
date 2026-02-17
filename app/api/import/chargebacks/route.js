@@ -2,6 +2,49 @@ import { getServiceSupabase } from '@/lib/supabase';
 import { NextResponse } from 'next/server';
 import Papa from 'papaparse';
 
+/* ── Smart Header Detection ── */
+const HEADER_KEYWORDS = ['amount','transaction','card','date','case','arn','reason','dispute',
+  'chargeback','reference','merchant','mid','status','customer','email','phone','order',
+  'acquirer','issuer','bin','pan','presentment','settlement','currency','authorization',
+  'refund','credit','debit','fee','network','visa','mastercard','processor'];
+
+function looksLikeHeaderRow(values) {
+  const lower = values.map(v => String(v).toLowerCase().trim());
+  let matches = 0;
+  for (const val of lower) {
+    for (const kw of HEADER_KEYWORDS) {
+      if (val.includes(kw)) { matches++; break; }
+    }
+  }
+  return matches >= 3;
+}
+
+function smartParse(text) {
+  let result = Papa.parse(text, { header: true, skipEmptyLines: true, transformHeader: h => h.trim() });
+  if (result.data.length === 0) return result;
+  const headers = Object.keys(result.data[0] || {});
+  if (looksLikeHeaderRow(headers)) return { ...result, detectedHeaderRow: 0 };
+  // Headers don't look right — scan first 30 rows for real header row
+  const rawResult = Papa.parse(text, { header: false, skipEmptyLines: true });
+  const rawRows = rawResult.data;
+  for (let i = 0; i < Math.min(rawRows.length, 30); i++) {
+    const row = rawRows[i];
+    if (!row || row.length < 3) continue;
+    if (looksLikeHeaderRow(row)) {
+      const dataRows = rawRows.slice(i + 1);
+      const realHeaders = row.map(h => String(h).trim());
+      const parsed = dataRows.filter(r => r.length >= 2).map(r => {
+        const obj = {};
+        realHeaders.forEach((h, idx) => { obj[h] = r[idx] !== undefined ? String(r[idx]).trim() : ''; });
+        return obj;
+      });
+      return { data: parsed, meta: { fields: realHeaders }, detectedHeaderRow: i };
+    }
+  }
+  return { ...result, detectedHeaderRow: -1 };
+}
+
+/* ── Column finders ── */
 function findCol(row, names) {
   for (const n of names) {
     const keys = Object.keys(row);
@@ -32,12 +75,74 @@ function parseAmount(val) {
   return parseFloat(str) || 0;
 }
 
-function looksLikeRef(val) {
-  if (!val) return false;
-  const s = String(val).trim();
-  return s.length > 0 && (/\d/.test(s) || s.length > 15);
+/* ── Auto-match chargebacks to shopify_orders ── */
+async function runMatching(db) {
+  const { data: unmatched } = await db.from('chargebacks')
+    .select('*').is('matched_order_id', null).limit(500);
+  if (!unmatched || unmatched.length === 0) return { total: 0, matched: 0 };
+
+  const { data: orders } = await db.from('shopify_orders').select('*').limit(5000);
+  if (!orders) return { total: unmatched.length, matched: 0 };
+
+  const emailMap = {};
+  const amountMap = {};
+  for (const o of orders) {
+    if (o.customer_email) {
+      const em = o.customer_email.toLowerCase().trim();
+      if (!emailMap[em]) emailMap[em] = [];
+      emailMap[em].push(o);
+    }
+    const amt = parseFloat(o.total_amount) || 0;
+    if (amt > 0) {
+      const key = amt.toFixed(2);
+      if (!amountMap[key]) amountMap[key] = [];
+      amountMap[key].push(o);
+    }
+  }
+
+  let high = 0, medium = 0, low = 0;
+  for (const cb of unmatched) {
+    const cbEmail = (cb.customer_email || '').toLowerCase().trim();
+    const cbAmt = parseFloat(cb.amount) || 0;
+    const cbAmtKey = cbAmt.toFixed(2);
+    let bestOrder = null, confidence = 'none';
+
+    // High: email + amount match
+    if (cbEmail && emailMap[cbEmail]) {
+      const byAmt = emailMap[cbEmail].find(o => Math.abs((parseFloat(o.total_amount)||0) - cbAmt) < 0.02);
+      if (byAmt) { bestOrder = byAmt; confidence = 'high'; }
+    }
+    // Medium: email only
+    if (!bestOrder && cbEmail && emailMap[cbEmail]) {
+      bestOrder = emailMap[cbEmail][0]; confidence = 'medium';
+    }
+    // Low: amount + card last4
+    if (!bestOrder && cbAmt > 0 && amountMap[cbAmtKey]) {
+      const card = cb.card_last4 || '';
+      if (card) {
+        const byCard = amountMap[cbAmtKey].find(o => (o.card_last4||'') === card);
+        if (byCard) { bestOrder = byCard; confidence = 'low'; }
+      }
+      if (!bestOrder && amountMap[cbAmtKey].length === 1) {
+        bestOrder = amountMap[cbAmtKey][0]; confidence = 'low';
+      }
+    }
+
+    if (bestOrder) {
+      await db.from('chargebacks').update({
+        matched_order_id: bestOrder.id,
+        match_confidence: confidence,
+        matched_shopify_order_number: bestOrder.order_number || null
+      }).eq('id', cb.id);
+      if (confidence === 'high') high++;
+      else if (confidence === 'medium') medium++;
+      else low++;
+    }
+  }
+  return { total: unmatched.length, high, medium, low, still_unmatched: unmatched.length - high - medium - low };
 }
 
+/* ── Main POST handler ── */
 export async function POST(request) {
   const db = getServiceSupabase();
   try {
@@ -49,149 +154,92 @@ export async function POST(request) {
     let text = await file.text();
     if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
 
-    const { data: rows, errors: parseErrors } = Papa.parse(text, {
-      header: true,
-      skipEmptyLines: true,
-      transformHeader: h => h.trim()
-    });
+    const parsed = smartParse(text);
+    const rows = parsed.data || [];
+    const headers = parsed.meta?.fields || (rows.length > 0 ? Object.keys(rows[0]) : []);
 
-    const headers = rows.length > 0 ? Object.keys(rows[0]) : [];
     let imported = 0, skipped = 0, errors = [];
+    const rawSample = rows.slice(0, 3);
 
     for (const row of rows) {
       const cbRef = findCol(row, ['Reference','Chargeback ID','Case Number','Case ID','Dispute ID',
-        'CB Reference','ARN','Case #','Chargeback Reference','CB Ref','CB ID','Chargeback #','CB #',
-        'Acquirer Reference Number','Chargeback Case Number','Retrieval Reference Number','RRN',
-        'Chargeback Case ID','Dispute Case ID','Dispute Number','Alert ID'])
-        || fuzzyFindCol(row, ['case num','case id','arn','dispute id','cb ref','cb id','reference num','retrieval'],
+        'CB Reference','ARN','Case #','Chargeback Reference','CB Ref','CB ID','Chargeback #',
+        'Acquirer Reference Number','Chargeback Case Number','Retrieval Reference Number','RRN'])
+        || fuzzyFindCol(row, ['case num','case id','arn','dispute id','cb ref','reference num','retrieval'],
           { exclude: ['merchant','amount','date','reason','status','name','card','email'] });
 
       const rawAmt = findCol(row, ['Amount','Dispute Amount','Chargeback Amount','CB Amount',
-        'Transaction Amount','Txn Amount','Amt','CB Amt','Gross Amount','Net Amount',
-        'Original Amount','Presentment Amount','Chargeback Amt','Original Transaction Amount',
-        'Original Txn Amount','Represented Amount','Disputed Amount'])
-        || fuzzyFindCol(row, ['amount','amt'], { exclude: ['date','code','reason','name','merchant','status'] });
+        'Transaction Amount','Txn Amount','Gross Amount','Net Amount','Presentment Amount',
+        'Original Amount','Disputed Amount'])
+        || fuzzyFindCol(row, ['amount','amt'], { exclude: ['date','code','reason','name','merchant'] });
+
       const amount = parseAmount(rawAmt);
 
-      const txnId = findCol(row, ['Transaction ID','Txn ID','Trans ID','Transaction #',
-        'Auth Code','Authorization Code','Processor Reference','Original Transaction ID',
-        'Merchant Reference Number','Payment ID','Order Number','Order ID','Invoice Number',
-        'Invoice ID','Merchant Order','Merchant Trans'])
-        || fuzzyFindCol(row, ['transaction id','txn id','trans id','auth code','order num','invoice','payment id'],
-          { exclude: ['date','amount','name','merchant name'] });
+      const email = findCol(row, ['Email','Customer Email','Cardholder Email','Card Holder Email'])
+        || fuzzyFindCol(row, ['email'], { exclude: ['merchant','company'] });
+      const name = findCol(row, ['Customer Name','Cardholder Name','Card Holder Name','Name'])
+        || fuzzyFindCol(row, ['customer','cardholder','card holder'], { exclude: ['email','phone','id','number'] });
+      const card = findCol(row, ['Card Last 4','Last 4','Card Number','Pan Last 4','Last Four'])
+        || fuzzyFindCol(row, ['last4','last 4','card num','pan'], { exclude: ['date','name'] });
 
-      const disputeDate = findCol(row, ['Dispute Date','CB Date','Chargeback Date','Filed Date',
-        'Open Date','Date','Received Date','Date Received','Report Date','Notification Date',
-        'Dispute Received','Date Filed','Date Opened','Created Date','Initiation Date','Post Date'])
-        || fuzzyFindCol(row, ['dispute date','chargeback date','filed date','received date','report date','notification date','initiation date','post date'],
-          { exclude: ['transaction','original','sale','order','amount'] });
+      const txnId = findCol(row, ['Transaction ID','Txn ID','Transaction Reference','Auth Code',
+        'Authorization Code','Trans ID'])
+        || fuzzyFindCol(row, ['transaction id','txn id','auth code'], { exclude: ['date','amount'] });
 
-      const txnDate = findCol(row, ['Transaction Date','Txn Date','Trans Date','Sale Date','Order Date',
-        'Original Transaction Date','Purchase Date','Original Date','Payment Date',
-        'Original Txn Date','Settle Date','Settlement Date','Processing Date'])
-        || fuzzyFindCol(row, ['transaction date','original date','sale date','purchase date','settle date','payment date'],
-          { exclude: ['dispute','chargeback','filed','received','notification'] });
+      const disputeDate = findCol(row, ['Dispute Date','Chargeback Date','CB Date','Date Opened',
+        'Date Created','Created Date','Date','Filed Date','Received Date'])
+        || fuzzyFindCol(row, ['date','filed','opened','created','received'],
+          { exclude: ['amount','code','reason','card','transaction','due'] });
 
-      const custName = findCol(row, ['Customer Name','Cardholder','Cardholder Name','Card Holder',
-        'Customer','Consumer Name','Buyer Name','Shopper Name'])
-        || fuzzyFindCol(row, ['cardholder','customer name','consumer','buyer'],
-          { exclude: ['email','phone','id','merchant'] });
+      const reasonCode = findCol(row, ['Reason Code','Reason','CB Reason','Chargeback Reason',
+        'Dispute Reason','Category'])
+        || fuzzyFindCol(row, ['reason','category'], { exclude: ['date','amount','name'] });
 
-      const custEmail = (findCol(row, ['Email','Customer Email','Cardholder Email','Consumer Email',
-        'Buyer Email','Shopper Email','Contact Email'])
-        || fuzzyFindCol(row, ['email'], { exclude: ['merchant','support'] })).toLowerCase().trim();
+      const status = findCol(row, ['Status','Case Status','Dispute Status','CB Status','Chargeback Status'])
+        || fuzzyFindCol(row, ['status','state'], { exclude: ['date','amount','name','reason'] });
 
-      const cardLast4 = findCol(row, ['Card Last 4','Last 4','Card Last4','Last Four','Card Number',
-        'Card #','Last 4 Digits','Card','PAN','Account Number','Acct Last 4','Card Ending',
-        'Credit Card','CC Number','CC Last 4','Card Num'])
-        || fuzzyFindCol(row, ['card','last 4','pan','acct','cc num'],
-          { exclude: ['cardholder','card holder','holder','name','type','brand','scheme'] });
-
-      const reasonCode = findCol(row, ['Reason Code','Code','CB Reason Code','Chargeback Reason Code',
-        'Dispute Code','Response Code'])
-        || fuzzyFindCol(row, ['reason code','dispute code'], { exclude: ['description'] });
-
-      const reasonDesc = findCol(row, ['Reason','Description','Reason Description','CB Reason',
-        'Chargeback Reason','Dispute Reason','Reason Text','CB Description'])
-        || fuzzyFindCol(row, ['reason desc','dispute reason','cb reason'],
-          { exclude: ['code'] });
-
-      const status = (findCol(row, ['Status','Case Status','Dispute Status','CB Status','Resolution','Outcome'])
-        || fuzzyFindCol(row, ['status','resolution','outcome'], { exclude: ['date','code','amount'] }) || 'open').toLowerCase();
-
-      if (amount <= 0) { skipped++; continue; }
-      if (!cbRef && !txnId && !custEmail && !cardLast4) { skipped++; continue; }
-
-      const finalRef = (looksLikeRef(cbRef) ? cbRef : '') || txnId || ('auto_' + Date.now() + '_' + imported);
+      // Skip rows with no meaningful data
+      if (amount <= 0 && !cbRef && !txnId && !email && !card) { skipped++; continue; }
 
       const record = {
         processor,
-        chargeback_ref: finalRef,
+        chargeback_ref: cbRef || txnId || null,
         transaction_id: txnId || null,
-        dispute_date: disputeDate || null,
-        transaction_date: txnDate || null,
         amount,
-        customer_name: custName || null,
-        customer_email: custEmail || null,
-        card_last4: cardLast4 ? String(cardLast4).replace(/[^0-9]/g, '').slice(-4) : null,
+        currency: findCol(row, ['Currency','Currency Code']) || fuzzyFindCol(row, ['currency','curr']) || 'USD',
+        dispute_date: disputeDate || null,
         reason_code: reasonCode || null,
-        reason_description: reasonDesc || null,
-        processor_status: status,
+        customer_name: name || null,
+        customer_email: email || null,
+        card_last4: card ? card.replace(/\D/g,'').slice(-4) : null,
+        processor_status: status || 'open',
+        match_confidence: 'none',
+        matched_order_id: null
       };
 
-      const { error } = await db.from('chargebacks').insert(record);
-      if (error) {
-        if (error.message.includes('duplicate') || error.message.includes('unique')) { skipped++; }
-        else { errors.push({ ref: record.chargeback_ref, error: error.message }); }
-      } else { imported++; }
+      const { error: insertErr } = await db.from('chargebacks').insert(record);
+      if (insertErr) {
+        errors.push(insertErr.message);
+        skipped++;
+      } else {
+        imported++;
+      }
     }
 
-    let matchResult = { total: 0, high: 0, medium: 0, low: 0 };
-    if (imported > 0) matchResult = await runMatching(db);
-
-    const raw_sample = rows.slice(0, 3);
+    // Auto-match after import
+    const matching = imported > 0 ? await runMatching(db) : null;
 
     return NextResponse.json({
-      success: true, imported, skipped,
-      errors: errors.slice(0, 10),
+      imported,
+      skipped,
       total_rows: rows.length,
-      headers_found: headers.slice(0, 30),
-      matching: matchResult,
-      raw_sample,
+      detectedHeaderRow: parsed.detectedHeaderRow ?? null,
+      headers,
+      raw_sample: rawSample,
+      matching,
+      errors: errors.slice(0, 5)
     });
   } catch (error) {
-    console.error('Import chargebacks error:', error);
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
-}
-
-async function runMatching(db) {
-  const { data: unmatched } = await db.from('chargebacks').select('*').is('matched_order_id', null);
-  if (!unmatched || unmatched.length === 0) return { total: 0, high: 0, medium: 0, low: 0 };
-  let highMatches = 0, medMatches = 0, lowMatches = 0;
-
-  for (const cb of unmatched) {
-    let matchedId = null, confidence = 'none', method = null;
-
-    if (cb.customer_email) {
-      const { data: match } = await db.from('shopify_orders').select('id')
-        .ilike('customer_email', cb.customer_email).eq('total_amount', cb.amount).limit(1);
-      if (match && match.length > 0) { matchedId = match[0].id; confidence = 'high'; method = 'email+amount'; highMatches++; }
-    }
-    if (!matchedId && cb.card_last4) {
-      const { data: match } = await db.from('shopify_orders').select('id')
-        .eq('total_amount', cb.amount).eq('card_last4', cb.card_last4).limit(1);
-      if (match && match.length > 0) { matchedId = match[0].id; confidence = 'medium'; method = 'amount+card'; medMatches++; }
-    }
-    if (!matchedId && cb.transaction_date) {
-      const txDate = new Date(cb.transaction_date);
-      const before = new Date(txDate); before.setDate(before.getDate() - 3);
-      const after = new Date(txDate); after.setDate(after.getDate() + 3);
-      const { data: match } = await db.from('shopify_orders').select('id')
-        .eq('total_amount', cb.amount).gte('order_date', before.toISOString()).lte('order_date', after.toISOString()).limit(1);
-      if (match && match.length > 0) { matchedId = match[0].id; confidence = 'low'; method = 'amount+date'; lowMatches++; }
-    }
-    await db.from('chargebacks').update({ matched_order_id: matchedId, match_confidence: confidence, match_method: method }).eq('id', cb.id);
-  }
-  return { total: unmatched.length, high: highMatches, medium: medMatches, low: lowMatches };
 }
