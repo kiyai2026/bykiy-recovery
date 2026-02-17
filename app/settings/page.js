@@ -126,8 +126,7 @@ function ImportSection({ title, icon, description, endpoint, fieldName, accept, 
       {uploading && <p className="text-brand text-sm mt-2 animate-pulse">Processing...</p>}
       {result && !result.error && (
         <div className="mt-3 p-3 bg-green-900/30 border border-green-800/50 rounded-lg">
-          <p className="text-green-300 text-sm flex items-center gap-2"><CheckCircle size={14} /> Imported {result.imported} records (of {result.total_rows || '?'} rows)</p>
-          {result.headers_found && <p className="text-gray-400 text-xs mt-1">Columns: {result.headers_found.join(', ')}</p>}
+          <p className="text-green-300 text-sm flex items-center gap-2"><CheckCircle size={14} /> Imported {result.imported} records</p>
           {result.matching && (
             <p className="text-green-400 text-xs mt-1">
               Auto-matched: {result.matching.high || 0} high, {result.matching.medium || 0} medium, {result.matching.low || 0} low
