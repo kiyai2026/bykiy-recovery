@@ -4,48 +4,51 @@ import { NextResponse } from 'next/server';
 export async function GET() {
   const db = getServiceSupabase();
   try {
-    // Fetch chargebacks with matched order info via left join
+    // Simple select without join first
     const { data: chargebacks, error } = await db
       .from('chargebacks')
-      .select('*, shopify_orders(*)')
+      .select('*')
       .order('dispute_date', { ascending: false })
       .limit(200);
 
-    if (error) throw error;
+    if (error) {
+      return NextResponse.json({ error: error.message, chargebacks: [] }, { status: 500 });
+    }
 
-    // Enrich each chargeback with order details
-    const enriched = (chargebacks || []).map(cb => {
-      const order = cb.shopify_orders || null;
-      let productNames = [];
-      let lineItems = [];
-
-      if (order) {
-        // Parse line_items JSON if present
-        if (order.line_items) {
-          try {
-            lineItems = typeof order.line_items === 'string' ? JSON.parse(order.line_items) : order.line_items;
-            productNames = lineItems.map(li => li.name || li.title || 'Unknown Item');
-          } catch (e) { /* ignore parse errors */ }
+    // For each chargeback with a matched_order_id, fetch the order
+    const enriched = [];
+    for (const cb of (chargebacks || [])) {
+      let orderInfo = {};
+      if (cb.matched_order_id) {
+        const { data: order } = await db
+          .from('shopify_orders')
+          .select('*')
+          .eq('id', cb.matched_order_id)
+          .single();
+        if (order) {
+          let lineItems = [];
+          let productNames = [];
+          if (order.line_items) {
+            try {
+              lineItems = typeof order.line_items === 'string' ? JSON.parse(order.line_items) : order.line_items;
+              productNames = lineItems.map(li => li.name || li.title || 'Unknown Item');
+            } catch (e) {}
+          }
+          orderInfo = {
+            order_number: order.order_number || null,
+            order_date: order.order_date || null,
+            order_amount: order.total_amount || null,
+            order_email: order.customer_email || null,
+            order_customer_name: order.customer_name || null,
+            order_financial_status: order.financial_status || null,
+            order_fulfillment_status: order.fulfillment_status || null,
+            product_names: productNames,
+            line_items: lineItems
+          };
         }
       }
-
-      return {
-        ...cb,
-        // Order info
-        order_number: order?.order_number || null,
-        order_date: order?.order_date || null,
-        order_amount: order?.total_amount || null,
-        order_email: order?.customer_email || null,
-        order_customer_name: order?.customer_name || null,
-        order_financial_status: order?.financial_status || null,
-        order_fulfillment_status: order?.fulfillment_status || null,
-        // Products
-        product_names: productNames,
-        line_items: lineItems,
-        // Clean up nested object
-        shopify_orders: undefined
-      };
-    });
+      enriched.push({ ...cb, ...orderInfo });
+    }
 
     return NextResponse.json({ chargebacks: enriched });
   } catch (error) {
