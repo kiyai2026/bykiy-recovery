@@ -6,16 +6,22 @@ function findCol(row, names) {
   for (const n of names) {
     const keys = Object.keys(row);
     const match = keys.find(k => k.trim().toLowerCase() === n.toLowerCase());
-    if (match && row[match] !== undefined && row[match] !== '') return row[match];
+    if (match && row[match] !== undefined && String(row[match]).trim() !== '') return String(row[match]).trim();
   }
   return '';
 }
 
-function fuzzyFindCol(row, keywords) {
+function fuzzyFindCol(row, keywords, opts = {}) {
   const keys = Object.keys(row);
+  const exclude = (opts.exclude || []).map(e => e.toLowerCase());
   for (const kw of keywords) {
-    const match = keys.find(k => k.toLowerCase().includes(kw.toLowerCase()));
-    if (match && row[match] !== undefined && row[match] !== '') return row[match];
+    const match = keys.find(k => {
+      const kl = k.toLowerCase();
+      if (!kl.includes(kw.toLowerCase())) return false;
+      for (const ex of exclude) { if (kl.includes(ex)) return false; }
+      return true;
+    });
+    if (match && row[match] !== undefined && String(row[match]).trim() !== '') return String(row[match]).trim();
   }
   return '';
 }
@@ -24,6 +30,12 @@ function parseAmount(val) {
   if (!val) return 0;
   const str = String(val).replace(/[^0-9.-]/g, '');
   return parseFloat(str) || 0;
+}
+
+function looksLikeRef(val) {
+  if (!val) return false;
+  const s = String(val).trim();
+  return s.length > 0 && (/\d/.test(s) || s.length > 15);
 }
 
 export async function POST(request) {
@@ -47,46 +59,74 @@ export async function POST(request) {
     let imported = 0, skipped = 0, errors = [];
 
     for (const row of rows) {
-      const cbRef = findCol(row, ['Reference','Chargeback ID','Case Number','Case ID','Dispute ID','CB Reference','ARN','ID','Case #','Chargeback Reference','Ref','CB ID','Chargeback #','CB #','CB Ref'])
-        || fuzzyFindCol(row, ['reference','case','arn','dispute id','chargeback','cb ref','cb id']);
+      const cbRef = findCol(row, ['Reference','Chargeback ID','Case Number','Case ID','Dispute ID',
+        'CB Reference','ARN','Case #','Chargeback Reference','CB Ref','CB ID','Chargeback #','CB #',
+        'Acquirer Reference Number','Chargeback Case Number','Retrieval Reference Number','RRN',
+        'Chargeback Case ID','Dispute Case ID','Dispute Number','Alert ID'])
+        || fuzzyFindCol(row, ['case num','case id','arn','dispute id','cb ref','cb id','reference num','retrieval'],
+          { exclude: ['merchant','amount','date','reason','status','name','card','email'] });
 
-      const amount = parseAmount(
-        findCol(row, ['Amount','Dispute Amount','Chargeback Amount','CB Amount','Transaction Amount','Txn Amount','Total','Amt','CB Amt','Gross Amount','Net Amount','Original Amount'])
-        || fuzzyFindCol(row, ['amount','amt','total','gross','net','dispute'])
-      );
+      const rawAmt = findCol(row, ['Amount','Dispute Amount','Chargeback Amount','CB Amount',
+        'Transaction Amount','Txn Amount','Amt','CB Amt','Gross Amount','Net Amount',
+        'Original Amount','Presentment Amount','Chargeback Amt','Original Transaction Amount',
+        'Original Txn Amount','Represented Amount','Disputed Amount'])
+        || fuzzyFindCol(row, ['amount','amt'], { exclude: ['date','code','reason','name','merchant','status'] });
+      const amount = parseAmount(rawAmt);
 
-      const txnId = findCol(row, ['Transaction ID','Txn ID','Trans ID','Transaction #','Auth Code','Authorization','Authorization Code','Processor Reference','Original Transaction ID','Merchant Reference'])
-        || fuzzyFindCol(row, ['transaction','txn','trans','auth','merchant ref']);
+      const txnId = findCol(row, ['Transaction ID','Txn ID','Trans ID','Transaction #',
+        'Auth Code','Authorization Code','Processor Reference','Original Transaction ID',
+        'Merchant Reference Number','Payment ID','Order Number','Order ID','Invoice Number',
+        'Invoice ID','Merchant Order','Merchant Trans'])
+        || fuzzyFindCol(row, ['transaction id','txn id','trans id','auth code','order num','invoice','payment id'],
+          { exclude: ['date','amount','name','merchant name'] });
 
-      const disputeDate = findCol(row, ['Dispute Date','CB Date','Chargeback Date','Filed Date','Open Date','Created','Date','Received Date','Date Received','Report Date','Notification Date'])
-        || fuzzyFindCol(row, ['dispute date','chargeback date','filed','received','report date','notification']);
+      const disputeDate = findCol(row, ['Dispute Date','CB Date','Chargeback Date','Filed Date',
+        'Open Date','Date','Received Date','Date Received','Report Date','Notification Date',
+        'Dispute Received','Date Filed','Date Opened','Created Date','Initiation Date','Post Date'])
+        || fuzzyFindCol(row, ['dispute date','chargeback date','filed date','received date','report date','notification date','initiation date','post date'],
+          { exclude: ['transaction','original','sale','order','amount'] });
 
-      const txnDate = findCol(row, ['Transaction Date','Txn Date','Trans Date','Sale Date','Order Date','Original Transaction Date','Purchase Date','Original Date'])
-        || fuzzyFindCol(row, ['transaction date','original date','sale date','purchase','order date']);
+      const txnDate = findCol(row, ['Transaction Date','Txn Date','Trans Date','Sale Date','Order Date',
+        'Original Transaction Date','Purchase Date','Original Date','Payment Date',
+        'Original Txn Date','Settle Date','Settlement Date','Processing Date'])
+        || fuzzyFindCol(row, ['transaction date','original date','sale date','purchase date','settle date','payment date'],
+          { exclude: ['dispute','chargeback','filed','received','notification'] });
 
-      const custName = findCol(row, ['Customer Name','Cardholder','Name','Cardholder Name','Card Holder','Customer','First Name','Consumer Name'])
-        || fuzzyFindCol(row, ['cardholder','customer','consumer','name']);
+      const custName = findCol(row, ['Customer Name','Cardholder','Cardholder Name','Card Holder',
+        'Customer','Consumer Name','Buyer Name','Shopper Name'])
+        || fuzzyFindCol(row, ['cardholder','customer name','consumer','buyer'],
+          { exclude: ['email','phone','id','merchant'] });
 
-      const custEmail = (findCol(row, ['Email','Customer Email','Cardholder Email','Consumer Email'])
-        || fuzzyFindCol(row, ['email'])).toLowerCase().trim();
+      const custEmail = (findCol(row, ['Email','Customer Email','Cardholder Email','Consumer Email',
+        'Buyer Email','Shopper Email','Contact Email'])
+        || fuzzyFindCol(row, ['email'], { exclude: ['merchant','support'] })).toLowerCase().trim();
 
-      const cardLast4 = findCol(row, ['Card Last 4','Last 4','Card Last4','Last Four','Card Number','Card #','Last 4 Digits','Card','PAN','Account Number'])
-        || fuzzyFindCol(row, ['card','last 4','pan','account']);
+      const cardLast4 = findCol(row, ['Card Last 4','Last 4','Card Last4','Last Four','Card Number',
+        'Card #','Last 4 Digits','Card','PAN','Account Number','Acct Last 4','Card Ending',
+        'Credit Card','CC Number','CC Last 4','Card Num'])
+        || fuzzyFindCol(row, ['card','last 4','pan','acct','cc num'],
+          { exclude: ['cardholder','card holder','holder','name','type','brand','scheme'] });
 
-      const reasonCode = findCol(row, ['Reason Code','Code','CB Reason Code','Chargeback Reason Code','Dispute Code'])
-        || fuzzyFindCol(row, ['reason code','dispute code']);
+      const reasonCode = findCol(row, ['Reason Code','Code','CB Reason Code','Chargeback Reason Code',
+        'Dispute Code','Response Code'])
+        || fuzzyFindCol(row, ['reason code','dispute code'], { exclude: ['description'] });
 
-      const reasonDesc = findCol(row, ['Reason','Description','Reason Description','CB Reason','Chargeback Reason','Dispute Reason'])
-        || fuzzyFindCol(row, ['reason','description','dispute reason']);
+      const reasonDesc = findCol(row, ['Reason','Description','Reason Description','CB Reason',
+        'Chargeback Reason','Dispute Reason','Reason Text','CB Description'])
+        || fuzzyFindCol(row, ['reason desc','dispute reason','cb reason'],
+          { exclude: ['code'] });
 
       const status = (findCol(row, ['Status','Case Status','Dispute Status','CB Status','Resolution','Outcome'])
-        || fuzzyFindCol(row, ['status','resolution','outcome']) || 'open').toLowerCase();
+        || fuzzyFindCol(row, ['status','resolution','outcome'], { exclude: ['date','code','amount'] }) || 'open').toLowerCase();
 
-      if (!cbRef && !amount && !txnId) { skipped++; continue; }
+      if (amount <= 0) { skipped++; continue; }
+      if (!cbRef && !txnId && !custEmail && !cardLast4) { skipped++; continue; }
+
+      const finalRef = (looksLikeRef(cbRef) ? cbRef : '') || txnId || ('auto_' + Date.now() + '_' + imported);
 
       const record = {
         processor,
-        chargeback_ref: cbRef || txnId || ('auto_' + Date.now() + '_' + imported),
+        chargeback_ref: finalRef,
         transaction_id: txnId || null,
         dispute_date: disputeDate || null,
         transaction_date: txnDate || null,
