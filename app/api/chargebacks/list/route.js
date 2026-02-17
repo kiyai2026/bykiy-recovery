@@ -32,7 +32,7 @@ export async function GET() {
       return {
         ...cb,
         // Order info
-        order_number: order?.order_number || cb.matched_shopify_order_number || null,
+        order_number: order?.order_number || null,
         order_date: order?.order_date || null,
         order_amount: order?.total_amount || null,
         order_email: order?.customer_email || null,
