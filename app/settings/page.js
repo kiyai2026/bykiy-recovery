@@ -15,7 +15,7 @@ export default function SettingsPage() {
         <ImportSection
           title="Import Shopify Orders"
           icon={<Database size={20} className="text-brand" />}
-          description="Export orders from Shopify (Orders â Export â CSV) and upload here. The system auto-assigns recovery tiers based on order age."
+          description="Export orders from Shopify (Orders Ã¢ÂÂ Export Ã¢ÂÂ CSV) and upload here. The system auto-assigns recovery tiers based on order age."
           endpoint="/api/import/shopify-orders"
           fieldName="file"
           accept=".csv"
@@ -75,9 +75,9 @@ export default function SettingsPage() {
             <h3 className="text-white font-semibold">How to Export from Shopify</h3>
           </div>
           <ol className="text-gray-300 text-sm space-y-2">
-            <li className="flex gap-2"><span className="text-brand font-bold">1.</span> Go to Shopify Admin â Orders</li>
+            <li className="flex gap-2"><span className="text-brand font-bold">1.</span> Go to Shopify Admin Ã¢ÂÂ Orders</li>
             <li className="flex gap-2"><span className="text-brand font-bold">2.</span> Filter: Unfulfilled + Date range</li>
-            <li className="flex gap-2"><span className="text-brand font-bold">3.</span> Click Export â CSV for current page</li>
+            <li className="flex gap-2"><span className="text-brand font-bold">3.</span> Click Export Ã¢ÂÂ CSV for current page</li>
             <li className="flex gap-2"><span className="text-brand font-bold">4.</span> Upload the CSV above</li>
           </ol>
           <div className="mt-4 p-3 bg-dark-800 rounded-lg">
@@ -125,12 +125,30 @@ function ImportSection({ title, icon, description, endpoint, fieldName, accept, 
       <input type="file" accept={accept} onChange={handleUpload} disabled={uploading} className="input w-full text-sm" />
       {uploading && <p className="text-brand text-sm mt-2 animate-pulse">Processing...</p>}
       {result && !result.error && (
-        <div className="mt-3 p-3 bg-green-900/30 border border-green-800/50 rounded-lg">
-          <p className="text-green-300 text-sm flex items-center gap-2"><CheckCircle size={14} /> Imported {result.imported} records</p>
+        <div className="mt-3 p-3 bg-green-900/30 border border-green-800/50 rounded-lg space-y-2">
+          <p className="text-green-300 text-sm flex items-center gap-2"><CheckCircle size={14} /> Imported {result.imported} records{result.skipped ? `, skipped ${result.skipped}` : ''}</p>
           {result.matching && (
-            <p className="text-green-400 text-xs mt-1">
+            <p className="text-green-400 text-xs">
               Auto-matched: {result.matching.high || 0} high, {result.matching.medium || 0} medium, {result.matching.low || 0} low
             </p>
+          )}
+          {result.headers_found && (
+            <details className="text-xs">
+              <summary className="text-gray-400 cursor-pointer hover:text-gray-300">CSV Headers ({result.headers_found.length} columns)</summary>
+              <p className="text-gray-500 mt-1 break-all">{result.headers_found.join(' | ')}</p>
+            </details>
+          )}
+          {result.raw_sample && result.raw_sample.length > 0 && (
+            <details className="text-xs">
+              <summary className="text-gray-400 cursor-pointer hover:text-gray-300">Raw Sample (first {result.raw_sample.length} rows)</summary>
+              <pre className="text-gray-500 mt-1 overflow-x-auto text-[10px] max-h-40 whitespace-pre-wrap">{JSON.stringify(result.raw_sample, null, 2)}</pre>
+            </details>
+          )}
+          {result.errors && result.errors.length > 0 && (
+            <details className="text-xs">
+              <summary className="text-red-400 cursor-pointer">Errors ({result.errors.length})</summary>
+              <pre className="text-red-500 mt-1 text-[10px]">{JSON.stringify(result.errors, null, 2)}</pre>
+            </details>
           )}
         </div>
       )}
