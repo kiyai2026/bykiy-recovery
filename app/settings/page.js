@@ -113,10 +113,25 @@ function ImportSection({ title, icon, description, endpoint, fieldName, accept, 
       {uploading && <p className="text-brand text-sm mt-2 animate-pulse">Processing...</p>}
       {hasImported && (
         <div className="mt-3 p-3 bg-green-900/30 border border-green-800/50 rounded-lg">
-          <p className="text-green-300 text-sm flex items-center gap-2"><CheckCircle size={14} /> Imported {result.imported} records</p>
+          <p className="text-green-300 text-sm flex items-center gap-2"><CheckCircle size={14} /> Imported {result.imported} records (parsed {result.total_rows || '?'} rows)</p>
           {result.skipped > 0 && <p className="text-yellow-400 text-xs mt-1">Skipped: {result.skipped} rows</p>}
           {result.matching && (
             <p className="text-green-400 text-xs mt-1">Auto-matched: {result.matching.high || 0} high, {result.matching.medium || 0} medium, {result.matching.low || 0} low</p>
+          )}
+          {result.headers_found && (
+            <p className="text-gray-400 text-xs mt-2">Columns: {result.headers_found.join(', ')}</p>
+          )}
+          {result.raw_sample && result.raw_sample.length > 0 && (
+            <details className="mt-2">
+              <summary className="text-gray-400 text-xs cursor-pointer">View raw sample data</summary>
+              <pre className="text-gray-300 text-xs mt-1 overflow-x-auto max-h-40 bg-dark-800 p-2 rounded">{JSON.stringify(result.raw_sample, null, 2)}</pre>
+            </details>
+          )}
+          {result.errors && result.errors.length > 0 && (
+            <div className="mt-2">
+              <p className="text-red-400 text-xs">Errors ({result.errors.length}):</p>
+              {result.errors.slice(0, 3).map((e, i) => <p key={i} className="text-red-300 text-xs">{JSON.stringify(e)}</p>)}
+            </div>
           )}
         </div>
       )}
