@@ -32,14 +32,7 @@ export async function POST(request) {
     const formData = await request.formData();
     const file = formData.get('file');
     const processor = formData.get('processor') || 'unknown';
-    if (!file) 
-    const raw_sample = rows.slice(0, 3).map(function(r) {
-      var obj = {};
-      Object.keys(r).forEach(function(k) { obj[k] = r[k]; });
-      return obj;
-    });
-
-    return NextResponse.json({ error: 'No file provided' }, { status: 400 });
+    if (!file) return NextResponse.json({ error: 'No file provided' }, { status: 400 });
 
     let text = await file.text();
     if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
@@ -116,13 +109,15 @@ export async function POST(request) {
     let matchResult = { total: 0, high: 0, medium: 0, low: 0 };
     if (imported > 0) matchResult = await runMatching(db);
 
+    const raw_sample = rows.slice(0, 3);
+
     return NextResponse.json({
       success: true, imported, skipped,
       errors: errors.slice(0, 10),
       total_rows: rows.length,
       headers_found: headers.slice(0, 30),
       matching: matchResult,
-      raw_sample: raw_sample,
+      raw_sample,
     });
   } catch (error) {
     console.error('Import chargebacks error:', error);
