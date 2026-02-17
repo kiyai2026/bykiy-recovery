@@ -2,11 +2,12 @@ import { getServiceSupabase } from '@/lib/supabase';
 import { NextResponse } from 'next/server';
 import Papa from 'papaparse';
 
-/* ── Smart Header Detection ── */
+/* -- Smart Header Detection -- */
 const HEADER_KEYWORDS = ['amount','transaction','card','date','case','arn','reason','dispute',
   'chargeback','reference','merchant','mid','status','customer','email','phone','order',
   'acquirer','issuer','bin','pan','presentment','settlement','currency','authorization',
-  'refund','credit','debit','fee','network','visa','mastercard','processor'];
+  'refund','credit','debit','fee','network','visa','mastercard','processor','cardholder',
+  'trans','received','original'];
 
 function looksLikeHeaderRow(values) {
   const lower = values.map(v => String(v).toLowerCase().trim());
@@ -24,7 +25,6 @@ function smartParse(text) {
   if (result.data.length === 0) return result;
   const headers = Object.keys(result.data[0] || {});
   if (looksLikeHeaderRow(headers)) return { ...result, detectedHeaderRow: 0 };
-  // Headers don't look right — scan first 30 rows for real header row
   const rawResult = Papa.parse(text, { header: false, skipEmptyLines: true });
   const rawRows = rawResult.data;
   for (let i = 0; i < Math.min(rawRows.length, 30); i++) {
@@ -44,7 +44,7 @@ function smartParse(text) {
   return { ...result, detectedHeaderRow: -1 };
 }
 
-/* ── Column finders ── */
+/* -- Column finders -- */
 function findCol(row, names) {
   for (const n of names) {
     const keys = Object.keys(row);
@@ -75,7 +75,7 @@ function parseAmount(val) {
   return parseFloat(str) || 0;
 }
 
-/* ── Auto-match chargebacks to shopify_orders ── */
+/* -- Auto-match chargebacks to shopify_orders -- */
 async function runMatching(db) {
   const { data: unmatched } = await db.from('chargebacks')
     .select('*').is('matched_order_id', null).limit(500);
@@ -107,16 +107,13 @@ async function runMatching(db) {
     const cbAmtKey = cbAmt.toFixed(2);
     let bestOrder = null, confidence = 'none';
 
-    // High: email + amount match
     if (cbEmail && emailMap[cbEmail]) {
       const byAmt = emailMap[cbEmail].find(o => Math.abs((parseFloat(o.total_amount)||0) - cbAmt) < 0.02);
       if (byAmt) { bestOrder = byAmt; confidence = 'high'; }
     }
-    // Medium: email only
     if (!bestOrder && cbEmail && emailMap[cbEmail]) {
       bestOrder = emailMap[cbEmail][0]; confidence = 'medium';
     }
-    // Low: amount + card last4
     if (!bestOrder && cbAmt > 0 && amountMap[cbAmtKey]) {
       const card = cb.card_last4 || '';
       if (card) {
@@ -131,8 +128,7 @@ async function runMatching(db) {
     if (bestOrder) {
       await db.from('chargebacks').update({
         matched_order_id: bestOrder.id,
-        match_confidence: confidence,
-        matched_shopify_order_number: bestOrder.order_number || null
+        match_confidence: confidence
       }).eq('id', cb.id);
       if (confidence === 'high') high++;
       else if (confidence === 'medium') medium++;
@@ -142,7 +138,7 @@ async function runMatching(db) {
   return { total: unmatched.length, high, medium, low, still_unmatched: unmatched.length - high - medium - low };
 }
 
-/* ── Main POST handler ── */
+/* -- Main POST handler -- */
 export async function POST(request) {
   const db = getServiceSupabase();
   try {
@@ -162,81 +158,81 @@ export async function POST(request) {
     const rawSample = rows.slice(0, 3);
 
     for (const row of rows) {
-      const cbRef = findCol(row, ['Reference','Chargeback ID','Case Number','Case ID','Dispute ID',
-        'CB Reference','ARN','Case #','Chargeback Reference','CB Ref','CB ID','Chargeback #',
-        'Acquirer Reference Number','Chargeback Case Number','Retrieval Reference Number','RRN'])
-        || fuzzyFindCol(row, ['case num','case id','arn','dispute id','cb ref','reference num','retrieval'],
+      const cbRef = findCol(row, ['Reference','Case','Case Number','Case ID','Dispute ID',
+        'Chargeback ID','CB Reference','ARN','Case #','Chargeback Reference','CB Ref',
+        'CB ID','Chargeback #','Acquirer Reference Number','Chargeback Case Number',
+        'Retrieval Reference Number','RRN'])
+        || fuzzyFindCol(row, ['case','arn','dispute id','cb ref','reference','retrieval'],
           { exclude: ['merchant','amount','date','reason','status','name','card','email'] });
 
       const rawAmt = findCol(row, ['Amount','Dispute Amount','Chargeback Amount','CB Amount',
         'Transaction Amount','Txn Amount','Gross Amount','Net Amount','Presentment Amount',
-        'Original Amount','Disputed Amount'])
+        'Original Amount','Disputed Amount','Original Trans Amount','Case Amount Total',
+        'Case Amount'])
         || fuzzyFindCol(row, ['amount','amt'], { exclude: ['date','code','reason','name','merchant'] });
-
       const amount = parseAmount(rawAmt);
 
       const email = findCol(row, ['Email','Customer Email','Cardholder Email','Card Holder Email'])
         || fuzzyFindCol(row, ['email'], { exclude: ['merchant','company'] });
       const name = findCol(row, ['Customer Name','Cardholder Name','Card Holder Name','Name'])
-        || fuzzyFindCol(row, ['customer','cardholder','card holder'], { exclude: ['email','phone','id','number'] });
-      const card = findCol(row, ['Card Last 4','Last 4','Card Number','Pan Last 4','Last Four'])
-        || fuzzyFindCol(row, ['last4','last 4','card num','pan'], { exclude: ['date','name'] });
+        || fuzzyFindCol(row, ['customer','cardholder','card holder'],
+          { exclude: ['email','phone','id','number','merchant'] });
+
+      const card = findCol(row, ['Card Last 4','Last 4','Card Number','Cardholder Number',
+        'Pan Last 4','Last Four','Card No'])
+        || fuzzyFindCol(row, ['last4','last 4','card num','cardholder num','pan'],
+          { exclude: ['date','name'] });
 
       const txnId = findCol(row, ['Transaction ID','Txn ID','Transaction Reference','Auth Code',
-        'Authorization Code','Trans ID'])
-        || fuzzyFindCol(row, ['transaction id','txn id','auth code'], { exclude: ['date','amount'] });
+        'Authorization Code','Trans ID','MID'])
+        || fuzzyFindCol(row, ['transaction id','txn id','auth code','mid'],
+          { exclude: ['date','amount'] });
 
       const disputeDate = findCol(row, ['Dispute Date','Chargeback Date','CB Date','Date Opened',
-        'Date Created','Created Date','Date','Filed Date','Received Date'])
-        || fuzzyFindCol(row, ['date','filed','opened','created','received'],
-          { exclude: ['amount','code','reason','card','transaction','due'] });
+        'Date Created','Created Date','Filed Date','Date Received','Received Date'])
+        || fuzzyFindCol(row, ['received','filed','opened','created','dispute'],
+          { exclude: ['amount','code','reason','card','trans'] });
+
+      const txnDate = findCol(row, ['Transaction Date','Trans Date','Purchase Date','Order Date',
+        'Original Date','Sale Date','Txn Date'])
+        || fuzzyFindCol(row, ['trans date','purchase','sale date','txn date','order date'],
+          { exclude: ['amount','code','reason','card','received','dispute'] });
 
       const reasonCode = findCol(row, ['Reason Code','Reason','CB Reason','Chargeback Reason',
         'Dispute Reason','Category'])
         || fuzzyFindCol(row, ['reason','category'], { exclude: ['date','amount','name'] });
 
-      const status = findCol(row, ['Status','Case Status','Dispute Status','CB Status','Chargeback Status'])
-        || fuzzyFindCol(row, ['status','state'], { exclude: ['date','amount','name','reason'] });
-
-      // Skip rows with no meaningful data
       if (amount <= 0 && !cbRef && !txnId && !email && !card) { skipped++; continue; }
 
       const record = {
         processor,
-        chargeback_ref: cbRef || txnId || null,
-        transaction_id: txnId || null,
+        transaction_id: cbRef || txnId || null,
         amount,
-        currency: findCol(row, ['Currency','Currency Code']) || fuzzyFindCol(row, ['currency','curr']) || 'USD',
         dispute_date: disputeDate || null,
+        transaction_date: txnDate || null,
         reason_code: reasonCode || null,
         customer_name: name || null,
         customer_email: email || null,
-        card_last4: card ? card.replace(/\D/g,'').slice(-4) : null,
-        processor_status: status || 'open',
+        card_last4: card ? card.replace(/\D/g, '').slice(-4) : null,
         match_confidence: 'none',
         matched_order_id: null
       };
 
       const { error: insertErr } = await db.from('chargebacks').insert(record);
       if (insertErr) {
-        errors.push(insertErr.message);
+        if (errors.length < 5) errors.push(insertErr.message);
         skipped++;
       } else {
         imported++;
       }
     }
 
-    // Auto-match after import
     const matching = imported > 0 ? await runMatching(db) : null;
 
     return NextResponse.json({
-      imported,
-      skipped,
-      total_rows: rows.length,
+      imported, skipped, total_rows: rows.length,
       detectedHeaderRow: parsed.detectedHeaderRow ?? null,
-      headers,
-      raw_sample: rawSample,
-      matching,
+      headers, raw_sample: rawSample, matching,
       errors: errors.slice(0, 5)
     });
   } catch (error) {
